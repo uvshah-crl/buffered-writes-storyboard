@@ -180,28 +180,6 @@ SET kv_transaction_buffered_writes_enabled = true;
 SET CLUSTER SETTING sql.defaults.transaction_buffered_writes.enabled = true;
 ```
 
-## System Requirements
-
-**Zero dependencies!** This is a pure HTML/CSS/JavaScript application.
-
-### What You Need
-- Any modern web browser (Chrome, Firefox, Safari, Edge)
-- No Node.js, Python, or other runtime required
-- No npm install, no build process
-- Works offline once downloaded
-
-### Recommended
-- Screen resolution: 1280x720 or higher
-- Modern browser (released within last 2 years)
-- For presentations: use fullscreen mode (F11)
-
-## Browser Compatibility
-
-- Chrome/Edge: ✅ Full support
-- Firefox: ✅ Full support
-- Safari: ✅ Full support
-- Mobile browsers: ✅ Responsive design (works on tablets/phones)
-
 ## Troubleshooting
 
 ### Issue: Animations not working
