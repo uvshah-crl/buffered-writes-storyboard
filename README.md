@@ -248,16 +248,6 @@ gh repo edit --enable-pages --pages-branch main
 ```
 Then share: `https://uvshah-crl.github.io/buffered-writes-storyboard/`
 
-## Future Enhancements
-
-Potential additions:
-- [ ] More detailed animations
-- [ ] Interactive network latency calculator
-- [ ] Customer-specific customization options
-- [ ] Multi-language support
-- [ ] Video export functionality
-- [ ] Embedded demo queries
-
 ## License
 
 Internal use for CockroachDB customer presentations.
