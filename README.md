@@ -258,12 +258,6 @@ Potential additions:
 - [ ] Video export functionality
 - [ ] Embedded demo queries
 
-## Credits
-
-- **Product Manager**: Dipti Joshi, Staff PM at Cockroach Labs
-- **Feature Released**: CockroachDB v25.2 (Public Preview)
-- **Content Source**: Internal Mica conversation, Confluence, Slack, public docs
-
 ## License
 
 Internal use for CockroachDB customer presentations.
