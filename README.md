@@ -2,6 +2,57 @@
 
 An interactive visual storyboard application for explaining CockroachDB's Buffered Writes feature to customers.
 
+> **Live Demo:** Open `index.html` in your browser - no installation required!
+
+## Installation
+
+### Quick Start (No Installation Required)
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/uvshah-crl/buffered-writes-storyboard.git
+   cd buffered-writes-storyboard
+   ```
+
+2. **Open in your browser:**
+   ```bash
+   # macOS
+   open index.html
+   
+   # Linux
+   xdg-open index.html
+   
+   # Windows
+   start index.html
+   ```
+
+That's it! The app runs entirely in your browser with no dependencies.
+
+### Optional: Local Web Server (Recommended for Best Experience)
+
+While not required, running a local web server can provide a better experience:
+
+**Option 1: Python (if installed)**
+```bash
+# Python 3
+python3 -m http.server 8000
+
+# Python 2
+python -m SimpleHTTPServer 8000
+```
+
+**Option 2: Node.js (if installed)**
+```bash
+npx serve
+```
+
+**Option 3: PHP (if installed)**
+```bash
+php -S localhost:8000
+```
+
+Then open: **http://localhost:8000**
+
 ## Features
 
 ### 📚 Six Interactive Sections
@@ -129,12 +180,41 @@ SET kv_transaction_buffered_writes_enabled = true;
 SET CLUSTER SETTING sql.defaults.transaction_buffered_writes.enabled = true;
 ```
 
+## System Requirements
+
+**Zero dependencies!** This is a pure HTML/CSS/JavaScript application.
+
+### What You Need
+- Any modern web browser (Chrome, Firefox, Safari, Edge)
+- No Node.js, Python, or other runtime required
+- No npm install, no build process
+- Works offline once downloaded
+
+### Recommended
+- Screen resolution: 1280x720 or higher
+- Modern browser (released within last 2 years)
+- For presentations: use fullscreen mode (F11)
+
 ## Browser Compatibility
 
 - Chrome/Edge: ✅ Full support
 - Firefox: ✅ Full support
 - Safari: ✅ Full support
-- Mobile browsers: ✅ Responsive design
+- Mobile browsers: ✅ Responsive design (works on tablets/phones)
+
+## Troubleshooting
+
+### Issue: Animations not working
+**Solution:** Make sure JavaScript is enabled in your browser. Check browser console for errors (F12).
+
+### Issue: Fonts look different than screenshots
+**Solution:** This is normal - the app uses system fonts. Appearance may vary slightly across operating systems.
+
+### Issue: Click-to-copy not working
+**Solution:** Some browsers require HTTPS for clipboard access. Use a local web server (see installation options above) instead of `file://` protocol.
+
+### Issue: Page looks broken on mobile
+**Solution:** Rotate device to landscape mode for best experience. Some diagrams require wider screens.
 
 ## Customization
 
@@ -149,9 +229,28 @@ The app uses CSS variables for easy theming. Edit `styles.css`:
 }
 ```
 
+## Sharing with Others
+
+### Send the GitHub Link
+Share the repository: https://github.com/uvshah-crl/buffered-writes-storyboard
+
+Recipients can clone and open `index.html` immediately.
+
+### Send as a Zip File
+1. Download the repository as ZIP from GitHub
+2. Share the ZIP file
+3. Recipient extracts and opens `index.html`
+
+### Host Online (Optional)
+Enable GitHub Pages to create a live URL:
+```bash
+gh repo edit --enable-pages --pages-branch main
+```
+Then share: `https://uvshah-crl.github.io/buffered-writes-storyboard/`
+
 ## Future Enhancements
 
-Potential additions for git repo version:
+Potential additions:
 - [ ] More detailed animations
 - [ ] Interactive network latency calculator
 - [ ] Customer-specific customization options
