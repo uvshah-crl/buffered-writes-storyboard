@@ -1,0 +1,1127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CockroachDB Buffered Writes - Visual Explainer</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🪳 CockroachDB Buffered Writes</h1>
+            <p class="subtitle">Understanding How Buffered Writes Optimize Distributed Transactions</p>
+        </header>
+
+        <!-- Navigation Tabs -->
+        <nav class="tabs">
+            <button class="tab active" data-section="overview">Overview</button>
+            <button class="tab" data-section="architecture">How It Works</button>
+            <button class="tab" data-section="comparison">Side-by-Side</button>
+            <button class="tab" data-section="analogy">Restaurant Analogy</button>
+            <button class="tab" data-section="performance">Performance Impact</button>
+            <button class="tab" data-section="takeaways">Key Takeaways</button>
+        </nav>
+
+        <!-- Overview Section -->
+        <section id="overview" class="section active">
+            <h2>What is Buffered Writes?</h2>
+            <div class="info-card">
+                <p><strong>Buffered Writes</strong> is an optimization introduced in CockroachDB v25.2 that temporarily stores transaction writes on the gateway node until commit time, rather than immediately sending them to the storage layer.</p>
+            </div>
+
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <div class="icon">🚀</div>
+                    <h3>Fewer Round Trips</h3>
+                    <p>Batches all writes into one coordinated flush at COMMIT instead of multiple sequential operations</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">♻️</div>
+                    <h3>Redundant Write Elimination</h3>
+                    <p>Only the final write for each key is sent to storage, eliminating intermediate updates</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">🔓</div>
+                    <h3>Non-Locking Writes</h3>
+                    <p>Can use simpler Put operations instead of conditional CPut operations</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">📊</div>
+                    <h3>Massive Latency Reduction</h3>
+                    <p>Multi-region SQL latency reduced from ~20ms to ~2.24ms in benchmarks</p>
+                </div>
+            </div>
+
+            <div class="info-banner">
+                <strong>v25.2:</strong> OFF by default (must enable explicitly) | <strong>v26.2+:</strong> ON by default | <strong>Enable in v25.2:</strong> <code>SET kv_transaction_buffered_writes_enabled = true;</code>
+            </div>
+        </section>
+
+        <!-- Architecture Section -->
+        <section id="architecture" class="section">
+            <h2>How It Works: Technical Deep Dive</h2>
+
+            <div class="architecture-tabs">
+                <button class="arch-tab active" data-mode="without">Without Buffered Writes</button>
+                <button class="arch-tab" data-mode="with">With Buffered Writes</button>
+            </div>
+
+            <!-- Without Buffered Writes -->
+            <div id="without-mode" class="architecture-mode active">
+                <h3>❌ Without Buffered Writes (Default in v25.2)</h3>
+
+                <div class="info-card">
+                    <p><strong>Mental Model:</strong> Every SQL write statement is immediately sent to the KV layer while the transaction is in progress. The gateway fires writes eagerly, right when each statement executes.</p>
+                </div>
+
+                <div class="example-transaction">
+                    <h4>Example Transaction:</h4>
+                    <pre><code>BEGIN;
+UPDATE accounts SET balance = balance - 500 WHERE id = 'alice';
+UPDATE accounts SET balance = balance + 500 WHERE id = 'bob';
+INSERT INTO audit_log VALUES ('transfer', 500, now());
+COMMIT;</code></pre>
+                </div>
+
+                <div class="flow-diagram" id="without-diagram">
+                    <div class="topology-header">
+                        <h4>🏗️ CockroachDB Cluster Topology</h4>
+                        <div class="topology-diagram">
+                            <div class="topology-layer">
+                                <div class="topo-label">Application Layer</div>
+                                <div class="topo-node client">Client App</div>
+                            </div>
+                            <div class="topology-layer">
+                                <div class="topo-label">SQL Layer</div>
+                                <div class="topo-node gateway-topo">Gateway Node<br>(Node 1)</div>
+                            </div>
+                            <div class="topology-layer">
+                                <div class="topo-label">KV Storage Layer (Distributed Ranges)</div>
+                                <div class="range-group">
+                                    <div class="range-box">
+                                        <div class="range-title">Range: accounts[alice]</div>
+                                        <div class="replica-set">
+                                            <div class="topo-node leaseholder-topo">Node 2 (L)</div>
+                                            <div class="topo-node replica-topo">Node 3 (R)</div>
+                                            <div class="topo-node replica-topo">Node 4 (R)</div>
+                                        </div>
+                                    </div>
+                                    <div class="range-box">
+                                        <div class="range-title">Range: accounts[bob]</div>
+                                        <div class="replica-set">
+                                            <div class="topo-node leaseholder-topo">Node 5 (L)</div>
+                                            <div class="topo-node replica-topo">Node 6 (R)</div>
+                                            <div class="topo-node replica-topo">Node 7 (R)</div>
+                                        </div>
+                                    </div>
+                                    <div class="range-box">
+                                        <div class="range-title">Range: audit_log</div>
+                                        <div class="replica-set">
+                                            <div class="topo-node leaseholder-topo">Node 8 (L)</div>
+                                            <div class="topo-node replica-topo">Node 9 (R)</div>
+                                            <div class="topo-node replica-topo">Node 2 (R)</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="legend">
+                            <span><strong>L</strong> = Leaseholder</span>
+                            <span><strong>R</strong> = Replica</span>
+                            <span>Raft quorum: 2/3 replicas must acknowledge</span>
+                        </div>
+                    </div>
+
+                    <div class="timeline">
+                        <div class="phase-header">🔵 BEGIN Transaction (txn_id: abc123)</div>
+
+                        <div class="step-group">
+                            <div class="step-label">Step 1: Client executes UPDATE accounts SET balance = balance - 500 WHERE id = 'alice'</div>
+
+                            <div class="detailed-flow">
+                                <div class="flow-step">
+                                    <div class="step-number">1.1</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label client-label">Client App</span>
+                                            <span class="latency-arrow">→ SQL query (~1ms network)</span>
+                                            <span class="node-label gateway-label">Gateway (Node 1)</span>
+                                        </div>
+                                        <div class="action">Gateway parses SQL, plans execution, identifies key = 'alice' in accounts range</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">1.2</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label gateway-label">Gateway (Node 1)</span>
+                                            <span class="latency-arrow">→ CPut request (~2ms network)</span>
+                                            <span class="node-label leaseholder-label">Node 2 (Leaseholder)</span>
+                                        </div>
+                                        <div class="action">Gateway sends <strong>CPut (Conditional Put)</strong> to create write intent</div>
+                                        <div class="technical-note">Operation: Acquire exclusive lock + write provisional value</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">1.3</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label leaseholder-label">Node 2</span>
+                                            <span class="latency-arrow">→ Raft Propose (~1ms)</span>
+                                            <div class="raft-group">
+                                                <span class="node-label replica-label">Node 3</span>
+                                                <span class="node-label replica-label">Node 4</span>
+                                            </div>
+                                        </div>
+                                        <div class="action">Leaseholder replicates via <strong>Raft consensus</strong> (needs 2/3 quorum)</div>
+                                        <div class="technical-note">Write intent stored: {key: alice, value: new_balance, txn: abc123, timestamp: t1}</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">1.4</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label leaseholder-label">Node 2</span>
+                                            <span class="latency-arrow">← ACK (~2ms network)</span>
+                                            <span class="node-label gateway-label">Gateway (Node 1)</span>
+                                            <span class="latency-arrow">← Result (~1ms network)</span>
+                                            <span class="node-label client-label">Client App</span>
+                                        </div>
+                                        <div class="action">Success acknowledgment returns to client</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="timing-summary">
+                                <strong>Total Latency:</strong> ~7ms (single-region) | ~90ms (multi-region cross-zone)
+                                <br><strong>Network Hops:</strong> Client→Gateway→Leaseholder→Replicas→Leaseholder→Gateway→Client
+                            </div>
+                            <div class="result">✓ Write intent created at KV layer with exclusive lock</div>
+                        </div>
+
+                        <div class="step-group">
+                            <div class="step-label">Step 2: Client executes UPDATE accounts SET balance = balance + 500 WHERE id = 'bob'</div>
+
+                            <div class="detailed-flow">
+                                <div class="flow-step">
+                                    <div class="step-number">2.1</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label client-label">Client App</span>
+                                            <span class="latency-arrow">→ SQL query (~1ms)</span>
+                                            <span class="node-label gateway-label">Gateway (Node 1)</span>
+                                        </div>
+                                        <div class="action">Gateway identifies key = 'bob' in different range</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">2.2</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label gateway-label">Gateway (Node 1)</span>
+                                            <span class="latency-arrow">→ CPut request (~2ms)</span>
+                                            <span class="node-label leaseholder-label">Node 5 (Different Leaseholder)</span>
+                                        </div>
+                                        <div class="action">CPut to create write intent for bob's account</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">2.3</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label leaseholder-label">Node 5</span>
+                                            <span class="latency-arrow">→ Raft Propose (~1ms)</span>
+                                            <div class="raft-group">
+                                                <span class="node-label replica-label">Node 6</span>
+                                                <span class="node-label replica-label">Node 7</span>
+                                            </div>
+                                        </div>
+                                        <div class="action">Raft replication to achieve quorum</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">2.4</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label leaseholder-label">Node 5</span>
+                                            <span class="latency-arrow">← ACK</span>
+                                            <span class="node-label gateway-label">Gateway</span>
+                                            <span class="latency-arrow">← Result</span>
+                                            <span class="node-label client-label">Client</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="timing-summary">
+                                <strong>Total Latency:</strong> ~7ms (another full round trip)
+                                <br><strong>Cumulative:</strong> ~14ms for 2 statements
+                            </div>
+                            <div class="result">✓ Second write intent created</div>
+                        </div>
+
+                        <div class="step-group">
+                            <div class="step-label">Step 3: Client executes INSERT INTO audit_log VALUES ('transfer', 500, now())</div>
+
+                            <div class="detailed-flow">
+                                <div class="flow-step">
+                                    <div class="step-number">3.1-3.4</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label client-label">Client</span>
+                                            <span class="latency-arrow">→</span>
+                                            <span class="node-label gateway-label">Gateway</span>
+                                            <span class="latency-arrow">→</span>
+                                            <span class="node-label leaseholder-label">Node 8</span>
+                                            <span class="latency-arrow">→ Raft →</span>
+                                            <div class="raft-group">
+                                                <span class="node-label replica-label">Node 9</span>
+                                                <span class="node-label replica-label">Node 2</span>
+                                            </div>
+                                        </div>
+                                        <div class="action">Same pattern: CPut → Raft replication → ACK</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="timing-summary">
+                                <strong>Total Latency:</strong> ~7ms
+                                <br><strong>Cumulative:</strong> ~21ms for 3 statements
+                            </div>
+                            <div class="result">✓ Third write intent created</div>
+                        </div>
+
+                        <div class="step-group commit-step">
+                            <div class="step-label">Step 4: Client executes COMMIT</div>
+
+                            <div class="detailed-flow">
+                                <div class="flow-step">
+                                    <div class="step-number">4.1</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label client-label">Client</span>
+                                            <span class="latency-arrow">→ COMMIT</span>
+                                            <span class="node-label gateway-label">Gateway</span>
+                                        </div>
+                                        <div class="action">Gateway initiates <strong>Parallel Commits</strong> protocol</div>
+                                        <div class="technical-note">Writes transaction record marking status as STAGING</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">4.2</div>
+                                    <div class="step-description">
+                                        <div class="action">Transaction record written to determine commit timestamp</div>
+                                        <div class="technical-note">All write intents already exist from steps 1-3, so can commit immediately</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">4.3</div>
+                                    <div class="step-description">
+                                        <div class="action"><strong>Asynchronous:</strong> Write intents converted to committed MVCC values</div>
+                                        <div class="technical-note">This happens after client receives success</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="timing-summary">
+                                <strong>COMMIT Latency:</strong> ~3-5ms
+                                <br><strong>🔴 TOTAL TRANSACTION LATENCY: ~24-26ms (single-region)</strong>
+                                <br><strong>🔴 TOTAL TRANSACTION LATENCY: ~270-280ms (multi-region)</strong>
+                            </div>
+                            <div class="result final">✓ Transaction committed, all write intents now visible as committed values</div>
+                        </div>
+                    </div>
+
+                    <div class="key-insights">
+                        <h4>Key Issues:</h4>
+                        <ul>
+                            <li>⚠️ <strong>Sequential network round trips:</strong> Each statement blocks on network latency</li>
+                            <li>⚠️ <strong>Heavy CPut operations:</strong> Conditional puts verify current value before writing</li>
+                            <li>⚠️ <strong>Latency multiplier:</strong> 3 statements = 3× network cost (21ms + 5ms commit = 26ms)</li>
+                            <li>⚠️ <strong>Multi-region penalty:</strong> In multi-region, 80ms × 3 = 240ms just for writes!</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="summary-box problem">
+                    <h4>Problems with this approach:</h4>
+                    <ul>
+                        <li><strong>Sequential network hops:</strong> Each statement waits for network round trip before next one starts</li>
+                        <li><strong>Redundant writes:</strong> If you update the same key twice, both updates are sent and replicated</li>
+                        <li><strong>Heavier locking:</strong> Uses CPut (conditional put) operations which verify current value</li>
+                        <li><strong>Latency multiplier:</strong> 3 write statements = 3× the network cost</li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- With Buffered Writes -->
+            <div id="with-mode" class="architecture-mode">
+                <h3>✅ With Buffered Writes</h3>
+
+                <div class="info-card success">
+                    <p><strong>Mental Model:</strong> The gateway holds all write operations in local memory (a buffer) and doesn't send anything to the KV layer until COMMIT. During statement execution, the gateway just accumulates what it intends to write.</p>
+                </div>
+
+                <div class="example-transaction">
+                    <h4>Same Transaction:</h4>
+                    <pre><code>BEGIN;
+UPDATE accounts SET balance = balance - 500 WHERE id = 'alice';
+UPDATE accounts SET balance = balance + 500 WHERE id = 'bob';
+INSERT INTO audit_log VALUES ('transfer', 500, now());
+COMMIT;</code></pre>
+                </div>
+
+                <div class="flow-diagram" id="with-diagram">
+                    <div class="topology-header">
+                        <h4>🏗️ Same CockroachDB Cluster Topology</h4>
+                        <div class="topology-diagram">
+                            <div class="topology-layer">
+                                <div class="topo-label">Application Layer</div>
+                                <div class="topo-node client">Client App</div>
+                            </div>
+                            <div class="topology-layer">
+                                <div class="topo-label">SQL Layer (with Write Buffer)</div>
+                                <div class="gateway-with-buffer">
+                                    <div class="topo-node gateway-topo">Gateway Node (Node 1)</div>
+                                    <div class="buffer-indicator">📦 In-Memory Write Buffer</div>
+                                </div>
+                            </div>
+                            <div class="topology-layer">
+                                <div class="topo-label">KV Storage Layer (Distributed Ranges)</div>
+                                <div class="range-group">
+                                    <div class="range-box">
+                                        <div class="range-title">Range: accounts[alice]</div>
+                                        <div class="replica-set">
+                                            <div class="topo-node leaseholder-topo">Node 2 (L)</div>
+                                            <div class="topo-node replica-topo">Node 3 (R)</div>
+                                            <div class="topo-node replica-topo">Node 4 (R)</div>
+                                        </div>
+                                    </div>
+                                    <div class="range-box">
+                                        <div class="range-title">Range: accounts[bob]</div>
+                                        <div class="replica-set">
+                                            <div class="topo-node leaseholder-topo">Node 5 (L)</div>
+                                            <div class="topo-node replica-topo">Node 6 (R)</div>
+                                            <div class="topo-node replica-topo">Node 7 (R)</div>
+                                        </div>
+                                    </div>
+                                    <div class="range-box">
+                                        <div class="range-title">Range: audit_log</div>
+                                        <div class="replica-set">
+                                            <div class="topo-node leaseholder-topo">Node 8 (L)</div>
+                                            <div class="topo-node replica-topo">Node 9 (R)</div>
+                                            <div class="topo-node replica-topo">Node 2 (R)</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="legend">
+                            <span><strong>Key Difference:</strong> Gateway has in-memory write buffer</span>
+                            <span>Writes stay local until COMMIT</span>
+                        </div>
+                    </div>
+
+                    <div class="timeline">
+                        <div class="phase-header">🔵 BEGIN Transaction (txn_id: xyz789, buffered_writes=ON)</div>
+
+                        <div class="step-group">
+                            <div class="step-label">Step 1: Client executes UPDATE accounts SET balance = balance - 500 WHERE id = 'alice'</div>
+
+                            <div class="detailed-flow">
+                                <div class="flow-step">
+                                    <div class="step-number">1.1</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label client-label">Client App</span>
+                                            <span class="latency-arrow">→ SQL query (~1ms network)</span>
+                                            <span class="node-label gateway-label">Gateway (Node 1)</span>
+                                        </div>
+                                        <div class="action">Gateway parses SQL, plans execution, identifies key = 'alice'</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step buffered-step">
+                                    <div class="step-number">1.2</div>
+                                    <div class="step-description">
+                                        <div class="action">✨ <strong>Buffered write:</strong> Gateway computes new balance locally</div>
+                                        <div class="buffer-state">
+                                            <div class="buffer-title">📦 Write Buffer State:</div>
+                                            <code>{ alice: {key: alice, value: new_balance, op: Put} }</code>
+                                        </div>
+                                        <div class="technical-note">🎯 No network call to KV layer | No write intent created yet | Uses <strong>Put</strong> (not CPut)</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">1.3</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label gateway-label">Gateway</span>
+                                            <span class="latency-arrow">← Success (~0ms)</span>
+                                            <span class="node-label client-label">Client App</span>
+                                        </div>
+                                        <div class="action">Client receives immediate success - no network wait!</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="timing-summary success">
+                                <strong>Total Latency:</strong> ~1ms (only Client→Gateway round trip)
+                                <br><strong>Network to KV layer:</strong> 0 hops ✓
+                                <br><strong>Savings:</strong> ~6ms vs without buffered writes
+                            </div>
+                            <div class="result success">✓ Write buffered in memory, no KV layer interaction</div>
+                        </div>
+
+                        <div class="step-group">
+                            <div class="step-label">Step 2: Client executes UPDATE accounts SET balance = balance + 500 WHERE id = 'bob'</div>
+
+                            <div class="detailed-flow">
+                                <div class="flow-step">
+                                    <div class="step-number">2.1</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label client-label">Client App</span>
+                                            <span class="latency-arrow">→ SQL query (~1ms)</span>
+                                            <span class="node-label gateway-label">Gateway</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step buffered-step">
+                                    <div class="step-number">2.2</div>
+                                    <div class="step-description">
+                                        <div class="action">✨ <strong>Buffered write:</strong> Compute and buffer bob's new balance</div>
+                                        <div class="buffer-state">
+                                            <div class="buffer-title">📦 Write Buffer State:</div>
+                                            <code>{ alice: {key: alice, value: new_balance, op: Put} }</code>
+                                            <code>{ bob: {key: bob, value: new_balance, op: Put} }</code>
+                                        </div>
+                                        <div class="technical-note">🎯 Still no network calls to KV layer</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">2.3</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label gateway-label">Gateway</span>
+                                            <span class="latency-arrow">← Success (~0ms)</span>
+                                            <span class="node-label client-label">Client</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="timing-summary success">
+                                <strong>Total Latency:</strong> ~1ms
+                                <br><strong>Cumulative:</strong> ~2ms for 2 statements (vs ~14ms without buffering)
+                            </div>
+                            <div class="result success">✓ Second write buffered</div>
+                        </div>
+
+                        <div class="step-group">
+                            <div class="step-label">Step 3: Client executes INSERT INTO audit_log VALUES ('transfer', 500, now())</div>
+
+                            <div class="detailed-flow">
+                                <div class="flow-step">
+                                    <div class="step-number">3.1</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label client-label">Client</span>
+                                            <span class="latency-arrow">→ SQL (~1ms)</span>
+                                            <span class="node-label gateway-label">Gateway</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step buffered-step">
+                                    <div class="step-number">3.2</div>
+                                    <div class="step-description">
+                                        <div class="action">✨ <strong>Buffered write:</strong> Prepare INSERT in buffer</div>
+                                        <div class="buffer-state">
+                                            <div class="buffer-title">📦 Write Buffer State:</div>
+                                            <code>{ alice: {key: alice, value: new_balance, op: Put} }</code>
+                                            <code>{ bob: {key: bob, value: new_balance, op: Put} }</code>
+                                            <code>{ audit_log_row: {key: new_id, value: {type:'transfer', amt:500, ts:now()}, op: Put} }</code>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="timing-summary success">
+                                <strong>Total Latency:</strong> ~1ms
+                                <br><strong>Cumulative:</strong> ~3ms for 3 statements (vs ~21ms without buffering)
+                            </div>
+                            <div class="result success">✓ All writes buffered, ready for commit</div>
+                        </div>
+
+                        <div class="step-group commit-step">
+                            <div class="step-label">Step 4: Client executes COMMIT - Parallel Flush to KV Layer</div>
+
+                            <div class="detailed-flow">
+                                <div class="flow-step">
+                                    <div class="step-number">4.1</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label client-label">Client</span>
+                                            <span class="latency-arrow">→ COMMIT</span>
+                                            <span class="node-label gateway-label">Gateway</span>
+                                        </div>
+                                        <div class="action">Gateway receives COMMIT - time to flush buffer!</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step highlight-step">
+                                    <div class="step-number">4.2</div>
+                                    <div class="step-description">
+                                        <div class="action">🚀 <strong>Parallel Flush:</strong> Gateway sends ALL buffered writes simultaneously</div>
+                                        <div class="parallel-diagram">
+                                            <div class="parallel-flow">
+                                                <div class="gateway-center">Gateway (Node 1)</div>
+                                                <div class="parallel-paths">
+                                                    <div class="parallel-path">
+                                                        <span class="latency-arrow">→ Put (alice) ~2ms →</span>
+                                                        <span class="node-label leaseholder-label">Node 2</span>
+                                                        <span class="raft-text">→ Raft[Node 3,4]</span>
+                                                    </div>
+                                                    <div class="parallel-path">
+                                                        <span class="latency-arrow">→ Put (bob) ~2ms →</span>
+                                                        <span class="node-label leaseholder-label">Node 5</span>
+                                                        <span class="raft-text">→ Raft[Node 6,7]</span>
+                                                    </div>
+                                                    <div class="parallel-path">
+                                                        <span class="latency-arrow">→ Put (audit) ~2ms →</span>
+                                                        <span class="node-label leaseholder-label">Node 8</span>
+                                                        <span class="raft-text">→ Raft[Node 9,2]</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="technical-note">🎯 All 3 leaseholders receive writes in parallel | Each does Raft replication | Using <strong>Put</strong> instead of CPut (simpler, faster)</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">4.3</div>
+                                    <div class="step-description">
+                                        <div class="action">All leaseholders achieve Raft quorum (2/3) and ACK back to gateway</div>
+                                        <div class="technical-note">Because writes happen in parallel, total time = max(write1, write2, write3) ≈ single write latency</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">4.4</div>
+                                    <div class="step-description">
+                                        <div class="action">Gateway writes transaction record (Parallel Commits protocol)</div>
+                                    </div>
+                                </div>
+
+                                <div class="flow-step">
+                                    <div class="step-number">4.5</div>
+                                    <div class="step-description">
+                                        <div class="flow-path">
+                                            <span class="node-label gateway-label">Gateway</span>
+                                            <span class="latency-arrow">← Success (~1ms)</span>
+                                            <span class="node-label client-label">Client App</span>
+                                        </div>
+                                        <div class="action">Transaction committed!</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="timing-summary success">
+                                <strong>COMMIT Latency:</strong> ~5-7ms (all writes flushed in parallel)
+                                <br><strong>🟢 TOTAL TRANSACTION LATENCY: ~8-10ms (single-region)</strong>
+                                <br><strong>🟢 TOTAL TRANSACTION LATENCY: ~90-100ms (multi-region)</strong>
+                                <br><br>
+                                <strong>⚡ Improvement vs without buffering:</strong>
+                                <br>Single-region: 26ms → 10ms = <strong>2.6× faster</strong>
+                                <br>Multi-region: 280ms → 100ms = <strong>2.8× faster</strong>
+                            </div>
+                            <div class="result final success">✓ All writes committed with single parallel flush</div>
+                        </div>
+                    </div>
+
+                    <div class="key-insights success">
+                        <h4>Key Advantages:</h4>
+                        <ul>
+                            <li>✅ <strong>Parallel execution:</strong> All KV writes happen simultaneously at COMMIT, not sequentially</li>
+                            <li>✅ <strong>Simpler Put operations:</strong> Uses Put instead of CPut (no conditional check needed)</li>
+                            <li>✅ <strong>Latency independence:</strong> Adding more statements in transaction doesn't add latency (until COMMIT)</li>
+                            <li>✅ <strong>Multi-region wins big:</strong> In multi-region, avoid sequential 80ms hops = massive savings</li>
+                            <li>✅ <strong>Redundant write elimination:</strong> If same key updated twice, only final value is sent to KV layer</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="summary-box success">
+                    <h4>Benefits:</h4>
+                    <ul>
+                        <li><strong>Parallel execution:</strong> All writes sent to their leaseholders at once, not sequentially</li>
+                        <li><strong>Eliminates redundant writes:</strong> If same key updated twice, only final value sent</li>
+                        <li><strong>Simpler operations:</strong> Can use Put instead of CPut (no conditional check needed)</li>
+                        <li><strong>Dramatic latency reduction:</strong> 1 effective round trip vs 4 sequential ones</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="interactive-controls">
+                <button id="animate-flow" class="btn-primary">▶️ Animate Flow</button>
+                <button id="reset-animation" class="btn-secondary">↺ Reset</button>
+            </div>
+        </section>
+
+        <!-- Comparison Section -->
+        <section id="comparison" class="section">
+            <h2>Side-by-Side Comparison</h2>
+
+            <div class="comparison-grid">
+                <div class="comparison-column">
+                    <h3>❌ Without Buffered Writes</h3>
+                    <div class="comparison-card">
+                        <h4>Redundant Write Example</h4>
+                        <pre><code>BEGIN;
+UPDATE inventory SET qty = 10 WHERE id = 'widget';
+-- Some logic...
+UPDATE inventory SET qty = 7 WHERE id = 'widget';
+COMMIT;</code></pre>
+                        <div class="write-flow">
+                            <div class="write-step">
+                                <span class="step-num">1</span>
+                                <span>UPDATE qty = 10</span>
+                                <span class="network">→ Network → KV Layer</span>
+                                <span class="raft">→ Raft Replication</span>
+                            </div>
+                            <div class="write-step">
+                                <span class="step-num">2</span>
+                                <span>UPDATE qty = 7</span>
+                                <span class="network">→ Network → KV Layer</span>
+                                <span class="raft">→ Raft Replication</span>
+                            </div>
+                            <div class="write-step">
+                                <span class="step-num">3</span>
+                                <span>COMMIT</span>
+                                <span class="network">→ Network</span>
+                            </div>
+                        </div>
+                        <div class="cost-summary problem">
+                            <strong>Cost:</strong> 2 full write operations + replication<br>
+                            <strong>Waste:</strong> qty=10 replicated but never committed
+                        </div>
+                    </div>
+                </div>
+
+                <div class="comparison-column">
+                    <h3>✅ With Buffered Writes</h3>
+                    <div class="comparison-card">
+                        <h4>Redundant Write Example</h4>
+                        <pre><code>BEGIN;
+UPDATE inventory SET qty = 10 WHERE id = 'widget';
+-- Some logic...
+UPDATE inventory SET qty = 7 WHERE id = 'widget';
+COMMIT;</code></pre>
+                        <div class="write-flow">
+                            <div class="write-step buffered">
+                                <span class="step-num">1</span>
+                                <span>UPDATE qty = 10</span>
+                                <span class="buffer-op">→ Buffer: { widget: 10 }</span>
+                            </div>
+                            <div class="write-step buffered">
+                                <span class="step-num">2</span>
+                                <span>UPDATE qty = 7</span>
+                                <span class="buffer-op">→ Buffer: { widget: 7 } (overwrite)</span>
+                            </div>
+                            <div class="write-step">
+                                <span class="step-num">3</span>
+                                <span>COMMIT</span>
+                                <span class="network">→ Flush qty = 7 only</span>
+                            </div>
+                        </div>
+                        <div class="cost-summary success">
+                            <strong>Cost:</strong> 1 write operation<br>
+                            <strong>Savings:</strong> qty=10 never touched the network!
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="latency-comparison">
+                <h3>Performance Comparison</h3>
+                <div class="scenario-tabs">
+                    <button class="scenario-tab active" data-scenario="single">Single-Region</button>
+                    <button class="scenario-tab" data-scenario="multi">Multi-Region</button>
+                </div>
+
+                <div id="single-scenario" class="scenario-content active">
+                    <h4>Single-Region Cluster (5 write statements)</h4>
+                    <p class="assumption">Assumption: Each KV round trip = 2ms</p>
+
+                    <div class="latency-bars">
+                        <div class="latency-row">
+                            <div class="label">Without Buffered Writes</div>
+                            <div class="bar-container">
+                                <div class="bar without" style="width: 100%;">
+                                    <span class="bar-value">~12ms</span>
+                                </div>
+                            </div>
+                            <div class="breakdown">6 round trips (5 writes + 1 commit) × 2ms</div>
+                        </div>
+                        <div class="latency-row">
+                            <div class="label">With Buffered Writes</div>
+                            <div class="bar-container">
+                                <div class="bar with" style="width: 16.67%;">
+                                    <span class="bar-value">~2ms</span>
+                                </div>
+                            </div>
+                            <div class="breakdown">1 parallel flush × 2ms</div>
+                        </div>
+                    </div>
+                    <div class="improvement">
+                        <strong>🚀 6× faster</strong> - 10ms saved
+                    </div>
+                </div>
+
+                <div id="multi-scenario" class="scenario-content">
+                    <h4>Multi-Region Cluster (5 write statements)</h4>
+                    <p class="assumption">Assumption: Each cross-region KV round trip = 80ms</p>
+
+                    <div class="latency-bars">
+                        <div class="latency-row">
+                            <div class="label">Without Buffered Writes</div>
+                            <div class="bar-container">
+                                <div class="bar without" style="width: 100%;">
+                                    <span class="bar-value">~480ms</span>
+                                </div>
+                            </div>
+                            <div class="breakdown">6 round trips × 80ms</div>
+                        </div>
+                        <div class="latency-row">
+                            <div class="label">With Buffered Writes</div>
+                            <div class="bar-container">
+                                <div class="bar with" style="width: 16.67%;">
+                                    <span class="bar-value">~80ms</span>
+                                </div>
+                            </div>
+                            <div class="breakdown">1 parallel flush × 80ms</div>
+                        </div>
+                    </div>
+                    <div class="improvement">
+                        <strong>🚀 6× faster</strong> - 400ms saved (nearly half a second!)
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Analogy Section -->
+        <section id="analogy" class="section">
+            <h2>🍽️ The Restaurant Analogy</h2>
+            <p class="analogy-intro">Think of a waiter taking your order at a restaurant...</p>
+
+            <div class="analogy-grid">
+                <div class="analogy-card">
+                    <h3>❌ Without Buffered Writes</h3>
+                    <h4>Waiter Sprints to Kitchen After Every Dish</h4>
+
+                    <div class="story-steps">
+                        <div class="story-step">
+                            <div class="step-icon">1️⃣</div>
+                            <div class="step-content">
+                                <strong>You:</strong> "I'll start with soup."<br>
+                                <strong>Waiter:</strong> Immediately runs to kitchen, tells chef, waits for confirmation, runs back
+                            </div>
+                            <div class="cost">⏱️ One round trip</div>
+                        </div>
+
+                        <div class="story-step">
+                            <div class="step-icon">2️⃣</div>
+                            <div class="step-content">
+                                <strong>You:</strong> "And a salad."<br>
+                                <strong>Waiter:</strong> Runs to kitchen again, confirms, runs back
+                            </div>
+                            <div class="cost">⏱️ Two round trips</div>
+                        </div>
+
+                        <div class="story-step">
+                            <div class="step-icon">3️⃣</div>
+                            <div class="step-content">
+                                <strong>You:</strong> "And a steak, medium rare."<br>
+                                <strong>Waiter:</strong> Runs to kitchen again
+                            </div>
+                            <div class="cost">⏱️ Three round trips</div>
+                        </div>
+
+                        <div class="story-step">
+                            <div class="step-icon">4️⃣</div>
+                            <div class="step-content">
+                                <strong>You:</strong> "Actually, change the steak to well done."<br>
+                                <strong>Waiter:</strong> Runs to kitchen, tells chef to update<br>
+                                <strong>Chef:</strong> Already started prep on medium-rare, now has to adjust
+                            </div>
+                            <div class="cost waste">🗑️ Wasted prep work</div>
+                        </div>
+                    </div>
+
+                    <div class="analogy-summary problem">
+                        <strong>Result:</strong> 4 trips to kitchen, wasted chef time on steak they had to change
+                    </div>
+                </div>
+
+                <div class="analogy-card">
+                    <h3>✅ With Buffered Writes</h3>
+                    <h4>Waiter Takes Whole Order, Then Goes Once</h4>
+
+                    <div class="story-steps">
+                        <div class="story-step">
+                            <div class="step-icon">1️⃣</div>
+                            <div class="step-content">
+                                <strong>You:</strong> "Soup, salad, steak medium rare."<br>
+                                <strong>Waiter:</strong> Writes it all on notepad, stays at table
+                            </div>
+                            <div class="notepad">
+                                📝 Notepad:<br>
+                                • Soup<br>
+                                • Salad<br>
+                                • Steak (medium rare)
+                            </div>
+                        </div>
+
+                        <div class="story-step">
+                            <div class="step-icon">2️⃣</div>
+                            <div class="step-content">
+                                <strong>You:</strong> "Actually, make it well done."<br>
+                                <strong>Waiter:</strong> Crosses out "medium rare", writes "well done" on notepad<br>
+                                <em>No kitchen trip yet. Zero wasted prep.</em>
+                            </div>
+                            <div class="notepad">
+                                📝 Notepad:<br>
+                                • Soup<br>
+                                • Salad<br>
+                                • Steak (<strike>medium rare</strike> well done)
+                            </div>
+                        </div>
+
+                        <div class="story-step">
+                            <div class="step-icon">3️⃣</div>
+                            <div class="step-content">
+                                <strong>You:</strong> "That's everything!" (= COMMIT)<br>
+                                <strong>Waiter:</strong> Walks to kitchen once, hands over complete final order<br>
+                                <strong>Chef:</strong> Gets clean order, preps in parallel
+                            </div>
+                            <div class="cost">⏱️ One trip total</div>
+                        </div>
+                    </div>
+
+                    <div class="analogy-summary success">
+                        <strong>Result:</strong> 1 trip to kitchen, clean order, no rework<br>
+                        Kitchen never knew about "medium rare" version - eliminated before it left the notepad!
+                    </div>
+                </div>
+            </div>
+
+            <div class="analogy-mapping">
+                <h3>How the Analogy Maps to CockroachDB</h3>
+                <div class="mapping-grid">
+                    <div class="mapping-item">
+                        <strong>Waiter</strong> → Gateway Node
+                    </div>
+                    <div class="mapping-item">
+                        <strong>Kitchen</strong> → KV Storage Layer
+                    </div>
+                    <div class="mapping-item">
+                        <strong>Notepad</strong> → In-Memory Buffer
+                    </div>
+                    <div class="mapping-item">
+                        <strong>Running to Kitchen</strong> → Network Round Trip
+                    </div>
+                    <div class="mapping-item">
+                        <strong>Final Order</strong> → COMMIT Flush
+                    </div>
+                    <div class="mapping-item">
+                        <strong>Crossed Out Item</strong> → Eliminated Redundant Write
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Performance Section -->
+        <section id="performance" class="section">
+            <h2>📊 Real Performance Impact</h2>
+
+            <div class="benchmark-grid">
+                <div class="benchmark-card">
+                    <h3>Multi-Region TPC-C (15 nodes)</h3>
+                    <div class="metric-row">
+                        <div class="metric">
+                            <div class="metric-label">SQL Latency</div>
+                            <div class="metric-comparison">
+                                <div class="old">v25.1: ~20ms</div>
+                                <div class="arrow">→</div>
+                                <div class="new">v25.2: ~2.24ms</div>
+                            </div>
+                            <div class="improvement-badge">9× improvement</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="benchmark-card">
+                    <h3>Single-Region (9 nodes)</h3>
+                    <div class="metric-row">
+                        <div class="metric">
+                            <div class="metric-label">tpmC Throughput</div>
+                            <div class="metric-value">63,100 tpmC</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">SQL Latency</div>
+                            <div class="metric-comparison">
+                                <div class="old">v25.1: ~3ms</div>
+                                <div class="arrow">→</div>
+                                <div class="new">v25.2: ~1.32ms</div>
+                            </div>
+                            <div class="improvement-badge">2.3× improvement</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="benchmark-card highlight">
+                    <h3>300-Node Scale Test (v25.4)</h3>
+                    <div class="metric-row">
+                        <div class="metric">
+                            <div class="metric-label">TPC-C NOWAIT with Buffered Writes</div>
+                            <div class="metric-value large">~2.2M tpmC</div>
+                            <div class="metric-detail">610K QPS @ ~9ms p90 latency</div>
+                        </div>
+                    </div>
+                    <div class="comparison-note">
+                        Same cluster without buffered writes: 820K tpmC<br>
+                        <strong>2.7× throughput improvement</strong>
+                    </div>
+                </div>
+            </div>
+
+            <div class="efficiency-claim">
+                <h3>Official Performance Claims (v25.2)</h3>
+                <blockquote>
+                    "CockroachDB 25.2 introduces two major optimizations that improve efficiency by <strong>41%</strong>, enabling businesses to scale more effectively with less hardware"
+                </blockquote>
+                <p class="claim-details">
+                    The two optimizations: <strong>Generic Query Plans</strong> + <strong>Buffered Writes</strong><br>
+                    <em>Note: Buffered writes improvements not included in baseline 50% claim since it's preview/off by default</em>
+                </p>
+            </div>
+
+            <div class="cost-impact">
+                <h3>💰 Cost Impact</h3>
+                <div class="info-card">
+                    <p>
+                        <strong>TCO Reduction:</strong> Buffered writes enhance transaction throughput and reduce operational cost by minimizing round-trips between gateway and storage nodes during write operations.
+                    </p>
+                    <p>
+                        <strong>Translation:</strong> Same throughput with fewer nodes = lower infrastructure costs
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Takeaways Section -->
+        <section id="takeaways" class="section">
+            <h2>Key Takeaways</h2>
+
+            <div class="takeaway-grid">
+                <div class="takeaway-card ideal">
+                    <h3>✅ Ideal Workloads</h3>
+                    <ul>
+                        <li><strong>Multi-statement explicit transactions</strong> - Primary target use case</li>
+                        <li><strong>Write-heavy workloads</strong> - Multiple DML statements per transaction</li>
+                        <li><strong>Multi-region deployments</strong> - Where network latency is most expensive</li>
+                    </ul>
+                </div>
+
+                <div class="takeaway-card caution">
+                    <h3>⚠️ Limitations & Caveats</h3>
+                    <ul>
+                        <li><strong>Version-specific defaults:</strong>
+                            <ul style="margin-top: 8px; padding-left: 20px;">
+                                <li>v25.2: OFF by default - Must be enabled explicitly via session or cluster setting</li>
+                                <li>v26.2+: ON by default - Enabled out of the box</li>
+                            </ul>
+                        </li>
+                        <li><strong>READ COMMITTED not supported (v25.2)</strong> - Only works with SERIALIZABLE isolation (default)</li>
+                        <li><strong>Potential retry errors</strong> - Some workloads may see increased retries</li>
+                        <li><strong>COMMIT gets heavier</strong> - More work happens at COMMIT vs during statements</li>
+                        <li><strong>Gateway memory usage</strong> - Very large transactions may hit limits</li>
+                        <li><strong>Observability gap</strong> - Limited tracing/profiling for COMMIT-time work</li>
+                    </ul>
+                </div>
+
+                <div class="takeaway-card howto">
+                    <h3>🔧 How to Enable (v25.2)</h3>
+                    <div class="code-block">
+                        <code>-- Session-level (recommended for testing)
+SET kv_transaction_buffered_writes_enabled = true;
+
+-- Cluster-level
+SET CLUSTER SETTING sql.defaults.transaction_buffered_writes.enabled = true;</code>
+                    </div>
+                    <p class="recommendation">
+                        <strong>Important for v25.2:</strong> Buffered writes are OFF by default and must be enabled explicitly. In v26.2+, they are ON by default.
+                    </p>
+                    <p class="recommendation">
+                        <strong>Recommendation:</strong> Test in staging environment with your actual workload before enabling in production
+                    </p>
+                </div>
+
+                <div class="takeaway-card talking-points">
+                    <h3>✨ Advantages</h3>
+                    <ul>
+                        <li><strong>"Under-the-covers, no app changes required"</strong> - Session/cluster setting flip, no SQL rewrites</li>
+                        <li><strong>"Batch your writes, cut your round trips"</strong> - Every KV round trip costs latency in distributed systems</li>
+                        <li><strong>"Particularly impactful for write-heavy, multi-statement transactions"</strong> - Where you'll see the most gain</li>
+                        <li><strong>"Significant latency improvements"</strong> - Up to 9× reduction in multi-region SQL latency</li>
+                        <li><strong>"Lower TCO through improved efficiency"</strong> - Same throughput with fewer nodes</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="product-info">
+                <h3>📋 Product Details</h3>
+                <table class="info-table">
+                    <tr>
+                        <td><strong>First Released</strong></td>
+                        <td>v25.2</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Default Status</strong></td>
+                        <td>v25.2: OFF by default (must enable) | v26.2+: ON by default</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Session Variable</strong></td>
+                        <td><code>kv_transaction_buffered_writes_enabled</code></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Known Customers Testing</strong></td>
+                        <td>Second Dinner, CoinDCX, SumUp, OneTrust, Uber (investigations)</td>
+                    </tr>
+                </table>
+            </div>
+        </section>
+
+        <footer>
+            <p>CockroachDB Buffered Writes Visual Explainer | Created for Customer Presentations</p>
+            <p class="version">Based on v25.2+ documentation and internal research</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
